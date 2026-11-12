@@ -1,0 +1,32 @@
+# Photos must never be committed
+in/
+clean/
+needs-attention/
+originals/
+samples/
+*.jpg
+*.jpeg
+*.png
+*.webp
+*.heic
+*.tif
+*.tiff
+
+# Local data and models
+*.sqlite
+*.db
+models/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+
+# OS
+.DS_Store
