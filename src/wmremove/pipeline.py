@@ -5,16 +5,19 @@ import logging
 import os
 import shutil
 import sqlite3
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
 import numpy as np
-from PIL import Image, JpegImagePlugin
+from PIL import Image, ImageOps, JpegImagePlugin
 
 from .detect import build_mask, find, score_at
 from .inpaint import remove
+from .overlays import ReferenceOverlays, locate, overlay_mask
+from .tilted import MIN_WORD_EVIDENCE
 
 log = logging.getLogger("wmremove")
 FOLDERS = ("in", "clean", "needs-attention", "originals")
@@ -105,46 +108,81 @@ def process(row_id, cfg, tpl, inpaint, db):
 
 
 def _run(original, cfg, tpl, inpaint):
+    return clean_image(original, cfg.root / "clean" / original.name, cfg, tpl, inpaint)
+
+
+def clean_image(original, dest, cfg, target, inpaint, *, exclusive=False):
+    bundled = isinstance(target, ReferenceOverlays)
     with Image.open(original) as im:
+        if getattr(im, "n_frames", 1) > 1:
+            raise ValueError("animated and multi-page images are unsupported")
         im.load()
-        fmt, info = im.format, dict(im.info)
+        fmt = im.format
         jpeg = fmt in ("JPEG", "MPO")
         tables = (im.quantization, JpegImagePlugin.get_sampling(im)) if jpeg else None
-        alpha = im.getchannel("A") if "A" in im.getbands() else None
-        rgb = np.asarray(im.convert("RGB"))
+        # Bundled overlays are positioned relative to the displayed photo.
+        photo = ImageOps.exif_transpose(im) if bundled else im
+        info = dict(photo.info)
+        alpha = photo.convert("RGBA").getchannel("A") if "A" in photo.getbands() or "transparency" in info else None
+        rgb = np.asarray(photo.convert("RGB"))
     gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
 
-    det = find(gray, tpl, cfg.min_share, cfg.max_share)
-    if det is None or det.score < cfg.min_score:
-        return "needs-attention", "watermark not found", det.score if det else None, None
-    grow = cfg.mask_grow or max(2, round(0.003 * max(gray.shape)))
-    mask = build_mask(gray.shape, det, tpl, grow)
-    if mask.mean() / 255 > cfg.max_mask_share:
-        return "needs-attention", "watermark covers too much of the photo", det.score, None
+    reversed_blend = None
+    if bundled:
+        matches = [
+            (overlay.template, det, overlay_mask(gray.shape, overlay, det, cfg.mask_grow))
+            for overlay in target.designs
+            if (det := locate(gray, overlay)) and det.score >= overlay.min_score
+        ]
+        score = max((det.score for _, det, _ in matches), default=None)
+        reversed_blend = target.tilted_torque.reverse(rgb)
+    else:
+        det = find(gray, target, cfg.min_share, cfg.max_share)
+        score = det.score if det else None
+        grow = cfg.mask_grow or max(2, round(0.003 * max(gray.shape)))
+        matches = [(target, det, build_mask(gray.shape, det, target, grow))] if det and score >= cfg.min_score else []
+    if not matches and reversed_blend is None:
+        return "needs-attention", "watermark not found", score, None
 
-    out = remove(rgb, mask, inpaint)
-    residual = score_at(cv2.cvtColor(out, cv2.COLOR_RGB2GRAY), tpl, det)
-    if residual >= cfg.max_residual:
-        return "needs-attention", "watermark still visible after removal", det.score, residual
+    masks = [mask for _, _, mask in matches]
+    if masks and np.count_nonzero(np.bitwise_or.reduce(masks)) / gray.size > cfg.max_mask_share:
+        return "needs-attention", "watermark covers too much of the photo", score, None
+    out = reversed_blend if reversed_blend is not None else rgb
+    for mask in masks:
+        out = remove(out, mask, inpaint)
+    out_gray = cv2.cvtColor(out, cv2.COLOR_RGB2GRAY)
+    residual = max((score_at(out_gray, tpl, det) for tpl, det, _ in matches), default=None)
+    if residual is not None and residual >= cfg.max_residual:
+        return "needs-attention", "watermark still visible after removal", score, residual
+    if reversed_blend is not None and target.tilted_torque.evidence(out) >= MIN_WORD_EVIDENCE:
+        return "needs-attention", "watermark still visible after removal", score, residual
 
-    _save(out, alpha, cfg.root / "clean" / original.name, "JPEG" if jpeg else fmt, info, tables)
-    return "clean", None, det.score, residual
+    _save(out, alpha, dest, "JPEG" if jpeg else fmt, info, tables, exclusive=exclusive)
+    return "clean", None, score, residual
 
 
-def _save(rgb, alpha, dest, fmt, info, tables):
+def _save(rgb, alpha, dest, fmt, info, tables, *, exclusive=False):
     out = Image.fromarray(rgb)
     if alpha is not None:
         out.putalpha(alpha)
     keep = {k: info[k] for k in ("exif", "icc_profile", "dpi") if k in info}
-    tmp = dest.with_name(dest.name + ".part")  # never expose a half-written file
+    fd, name = tempfile.mkstemp(suffix=".part", dir=dest.parent)
+    os.close(fd)
+    tmp = Path(name)
     try:
-        if tables is None:
-            out.save(tmp, format=fmt, **keep)
-        else:  # reuse the photo's own JPEG tables so untouched areas barely change
-            out.save(tmp, format=fmt, qtables=tables[0], subsampling=tables[1], **keep)
-    except (ValueError, OSError):
-        out.save(tmp, format=fmt, quality=95, **keep)
-    tmp.replace(dest)
+        try:
+            if tables is None:
+                out.save(tmp, format=fmt, **keep)
+            else:  # reuse the photo's own JPEG tables so untouched areas barely change
+                out.save(tmp, format=fmt, qtables=tables[0], subsampling=tables[1], **keep)
+        except (ValueError, OSError):
+            out.save(tmp, format=fmt, quality=95, **keep)
+        if exclusive:
+            os.link(tmp, dest)
+        else:
+            tmp.replace(dest)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def resume(cfg, tpl, inpaint, db):

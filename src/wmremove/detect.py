@@ -30,6 +30,15 @@ class Template:
         img = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
         if img is None:
             raise FileNotFoundError(f"cannot read watermark template: {path}")
+        self._load(img, 128)
+
+    @classmethod
+    def from_array(cls, img, background=128):
+        template = cls.__new__(cls)
+        template._load(img, background)
+        return template
+
+    def _load(self, img, background):
         if img.ndim == 2:
             img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
         self.alpha = None
@@ -37,13 +46,13 @@ class Template:
         if img.shape[2] == 4 and img[..., 3].min() < 250:
             self.alpha = img[..., 3]
             a = self.alpha[..., None].astype(np.float32) / 255
-            bgr = bgr * a + 128 * (1 - a)  # show the mark on mid grey
+            bgr = bgr * a + background * (1 - a)
         self.gray = cv2.cvtColor(bgr.astype(np.uint8), cv2.COLOR_BGR2GRAY)
 
 
 def _resize(img, w, h):
     shrink = w < img.shape[1]
-    return cv2.resize(img, (w, h), interpolation=cv2.INTER_AREA if shrink else cv2.INTER_LINEAR)
+    return cv2.resize(img, (max(w, 1), max(h, 1)), interpolation=cv2.INTER_AREA if shrink else cv2.INTER_LINEAR)
 
 
 def _highpass(gray):
@@ -69,12 +78,14 @@ def _scaled(tpl, tw, th):
 def _ncc(feat, feat_sq, t, m):
     """Normalised correlation of template t at every position, counting only pixels where m is 1."""
     n = float(m.sum())
+    if not n:
+        return np.zeros((feat.shape[0] - t.shape[0] + 1, feat.shape[1] - t.shape[1] + 1), np.float32)
     t = (t - float((t * m).sum()) / n) * m
     num = cv2.matchTemplate(feat, t, cv2.TM_CCORR)
     s1 = cv2.matchTemplate(feat, m, cv2.TM_CCORR)
     s2 = cv2.matchTemplate(feat_sq, m, cv2.TM_CCORR)
     var = np.maximum(s2 - s1 * s1 / n, n * MIN_CONTRAST**2)
-    return num / np.sqrt(var * float((t * t).sum()))
+    return num / np.sqrt(var * max(float((t * t).sum()), 1e-6))
 
 
 def _best(gray, tpl, f, scales, near=None):
@@ -102,17 +113,19 @@ def _best(gray, tpl, f, scales, near=None):
     return best
 
 
-def find(gray, tpl, min_share=0.08, max_share=1.0):
+def find(gray, tpl, min_share=0.08, max_share=1.0, scale_step=0.015):
     """Locate the watermark in a grayscale photo, anywhere in it.
     min_share and max_share bound the watermark's width as a share of the photo's width."""
     long_side = max(gray.shape)
     unit = gray.shape[1] / tpl.gray.shape[1]  # scale at which the mark is as wide as the photo
-    scales = _steps(min_share * unit, max_share * unit, 0.015)
+    scales = _steps(min_share * unit, max_share * unit, scale_step)
     coarse = _best(gray, tpl, min(1.0, COARSE_SIDE / long_side), scales)
     if coarse is None:
         return None
     s0 = coarse[1]
-    fine = _best(gray, tpl, min(1.0, FINE_SIDE / long_side), _steps(s0 / 1.03, s0 * 1.03, 0.003), near=coarse)
+    fine_range = 1 + max(0.03, scale_step)
+    fine = _best(gray, tpl, min(1.0, FINE_SIDE / long_side),
+                 _steps(s0 / fine_range, s0 * fine_range, 0.003), near=coarse)
     score, s, x, y, w, h = fine or coarse
     return Detection(round(x), round(y), round(w), round(h), s, score)
 

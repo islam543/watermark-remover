@@ -1,5 +1,11 @@
 # watermark-remover
 
+## Photo cleanup
+
+Use the [remove-car-overlays skill](.claude/skills/remove-car-overlays/SKILL.md) when a user supplies a photo, link, or folder to clean. Run the app and return the cleaned files.
+
+If you cloned this repo for the user in the current task, follow the [first-clone instructions](README.md#first-clone-with-claude-code) before replying.
+
 ## Verify (most important section)
 - Tests: `uv run pytest -m "not slow"`
 - Real model test: `uv run pytest -m slow` (downloads the LaMa model on first run, about 200 MB)

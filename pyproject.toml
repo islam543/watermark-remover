@@ -1,7 +1,7 @@
 [project]
 name = "wmremove"
 version = "0.1.0"
-description = "Drop a photo in a folder, get it back without your own fixed watermark. Runs locally."
+description = "Remove supported car-photo overlays from image links and local folders."
 requires-python = ">=3.10,<3.12"
 dependencies = ["iopaint>=1.4"]
 

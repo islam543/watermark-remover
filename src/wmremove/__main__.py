@@ -1,39 +1,69 @@
-"""The folder service: `python -m wmremove`. Stop it with Ctrl+C."""
+"""Run a one-off cleanup or keep watching the drop folder."""
 from __future__ import annotations
 
+import argparse
 import logging
+import os
 import signal
 import sys
 import threading
+from functools import cache
+from pathlib import Path
 
+from .batch import run_batch
 from .detect import Template
 from .inpaint import Lama
+from .overlays import load_overlays
 from .pipeline import Config, log, open_db, poll_once, resume
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Remove the QatarSale, Torque Motors, Qatar Living and Mzad Qatar image overlays.")
+    parser.add_argument("source", nargs="?", help="image file, folder, or HTTP(S) image or gallery link")
+    parser.add_argument("-o", "--output", type=Path, help="output file for a single image or output folder for a batch")
+    args = parser.parse_args()
+    if args.output and not args.source:
+        parser.error("--output requires an input file, folder, or link")
+
     logging.basicConfig(stream=sys.stdout, level=logging.INFO, format="%(asctime)s %(message)s")
     cfg = Config.from_env()
     try:
-        tpl = Template(cfg.template)
-    except FileNotFoundError as exc:
-        sys.exit(f"{exc}\nPut a picture of your watermark there, or set WM_TEMPLATE.")
-    db = open_db(cfg)
-    log.info("loading the model")
-    inpaint = Lama(cfg.device)
+        target = Template(cfg.template) if "WM_TEMPLATE" in os.environ or cfg.template.is_file() else load_overlays()
+    except (OSError, ValueError) as exc:
+        parser.exit(1, f"{exc}\n")
 
+    @cache
+    def model():
+        log.info("loading the model")
+        return Lama(cfg.device)
+
+    def inpaint(rgb, mask):
+        return model()(rgb, mask)
+
+    if args.source:
+        try:
+            return run_batch(args.source, args.output, cfg, target, inpaint)
+        except (OSError, ValueError) as exc:
+            log.error("%s", exc)
+            return 1
+
+    db = open_db(cfg)
     stop = threading.Event()  # finish the current photo, then exit
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, lambda *_: stop.set())
 
-    resume(cfg, tpl, inpaint, db)
-    log.info("watching %s", cfg.root / "in")
-    sizes = {}
-    while not stop.is_set():
-        poll_once(cfg, tpl, inpaint, db, sizes)
-        stop.wait(1.0)
+    try:
+        resume(cfg, target, inpaint, db)
+        log.info("watching %s", cfg.root / "in")
+        sizes = {}
+        while not stop.is_set():
+            poll_once(cfg, target, inpaint, db, sizes)
+            stop.wait(1.0)
+    finally:
+        db.close()
     log.info("stopped")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
