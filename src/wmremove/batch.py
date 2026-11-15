@@ -4,17 +4,21 @@ from __future__ import annotations
 import io
 import json
 import logging
+import os
+import re
+import shutil
 import tempfile
 from html.parser import HTMLParser
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from urllib.error import HTTPError, URLError
-from urllib.parse import unquote, urljoin, urlsplit
+from urllib.parse import quote, unquote, urljoin, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
 import cv2
 from PIL import Image, UnidentifiedImageError
 
 from .pipeline import _free, clean_image
+from .showrooms import showroom_listings, showroom_route
 
 log = logging.getLogger("wmremove")
 EXTENSIONS = {"JPEG": ".jpg", "PNG": ".png", "WEBP": ".webp", "TIFF": ".tiff"}
@@ -105,7 +109,11 @@ class _Gallery(HTMLParser):
 
     def urls(self, page):
         links = {}
-        for candidates in (self.photos, self.products, self.previews):
+        domain = (urlsplit(page).hostname or "").removeprefix("www.")
+        sources = (self.photos, self.products)
+        if domain not in {"qatarsale.com", "mzadqatar.com", "qatarliving.com"}:
+            sources += (self.previews,)
+        for candidates in sources:
             for item in candidates:
                 if isinstance(item, str) and item.strip():
                     url = urljoin(page, item.strip())
@@ -128,6 +136,28 @@ def _stage_image(url, data, work):
     return path
 
 
+def _read_gallery_photo(url):
+    parsed = urlsplit(url)
+    if parsed.hostname == "qlv-media-prod.qatarliving.com" and parsed.path.startswith("/ad-images-output/"):
+        # The listing metadata often advertises a missing original. Use the
+        # same large WebP that the listing displays when you open the gallery.
+        photo = PurePosixPath(unquote(parsed.path))
+        directory = photo.parent
+        stem = photo.stem
+        if directory.name == "thumbnail":
+            stem = re.sub(r"_\d+x\d+$", "", stem)
+            directory = directory.parent
+        gallery_path = quote(str(directory / "thumbnail" / f"{stem}_900x675.webp"))
+        gallery_url = urlunsplit(parsed._replace(path=gallery_path, query="", fragment=""))
+        if gallery_url != url:
+            try:
+                return _read_url(gallery_url)
+            except HTTPError as exc:
+                if exc.code not in (403, 404, 410):
+                    raise
+    return _read_url(url)
+
+
 def _is_link(source):
     return urlsplit(source).scheme.lower() in {"http", "https"}
 
@@ -145,21 +175,85 @@ def _run_image(src, dest, cfg, target, inpaint):
     return False
 
 
-def _run_gallery(links, work, output, cfg, target, inpaint):
+def _save_download(source, dest):
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=dest.parent) as staging:
+        staged = Path(staging) / dest.name
+        shutil.copyfile(source, staged)
+        os.link(staged, dest)
+    log.info("Saved %s", dest)
+    return True
+
+
+def _run_gallery(links, work, output, save):
     count = 0
     for url in links:
         try:
-            final, _, data = _read_url(url)
+            final, _, data = _read_gallery_photo(url)
             src = _stage_image(final, data, work)
+            count += save(src, _free(output / src.name))
         except (OSError, ValueError, Image.DecompressionBombError) as exc:
             log.error("Could not load %s: %s", url, exc)
             continue
-        count += _run_image(src, _free(output / src.name), cfg, target, inpaint)
     return count, len(links)
 
 
-def run_batch(source, output, cfg, target, inpaint):
+def _gallery_links(url, data):
+    gallery = _Gallery()
+    gallery.feed(data.decode("utf-8", errors="replace"))
+    links = gallery.urls(url)
+    if not links:
+        raise ValueError("no gallery photos found; paste a car listing, a showroom, or a direct image link")
+    return links
+
+
+def _run_showroom(route, output, save, download_only):
+    listings = {}
+    inventory_complete = True
+    try:
+        listings.update(showroom_listings(route, lambda url: _read_url(url)[2]))
+    except (OSError, ValueError) as exc:
+        log.error("Could not finish reading the showroom inventory: %s", exc)
+        inventory_complete = False
+    if not listings:
+        if inventory_complete:
+            log.info("No car listings found in the showroom")
+        return 1
+
+    folder = "showroom-photos" if download_only else "showroom-clean"
+    dest = output or _free(Path.cwd() / folder)
+    dest.mkdir(parents=True, exist_ok=output is not None)
+    log.info("Found %d car listings. Saving photos in %s", len(listings), dest.resolve())
+    done = total = cars_done = 0
+    for index, (listing_id, link) in enumerate(listings.items(), 1):
+        log.info("Car %d of %d: %s", index, len(listings), link)
+        try:
+            url, content_type, data = _read_url(link)
+            if content_type not in {"text/html", "application/xhtml+xml"}:
+                raise ValueError("the listing did not return an HTML page")
+            links = _gallery_links(url, data)
+            with tempfile.TemporaryDirectory(prefix="wmremove-") as tmp:
+                saved, expected = _run_gallery(links, Path(tmp), dest / listing_id, save)
+            done += saved
+            total += expected
+            cars_done += saved == expected
+        except (OSError, ValueError) as exc:
+            log.error("Could not read car %s: %s", listing_id, exc)
+
+    log.info("%s %d of %d photos found. Completed %d of %d discovered car galleries.",
+             "Downloaded" if download_only else "Cleaned", done, total, cars_done, len(listings))
+    return 0 if inventory_complete and cars_done == len(listings) else 1
+
+
+def run_batch(source, output, cfg, target, inpaint, *, download_only=False):
+    def save(src, dest):
+        if download_only:
+            return _save_download(src, dest)
+        return _run_image(src, dest, cfg, target, inpaint)
+
     if _is_link(source):
+        if route := showroom_route(source):
+            return _run_showroom(route, output, save, download_only)
         url, content_type, data = _read_url(source)
         with tempfile.TemporaryDirectory(prefix="wmremove-") as tmp:
             work = Path(tmp)
@@ -168,18 +262,18 @@ def run_batch(source, output, cfg, target, inpaint):
             except UnidentifiedImageError:
                 if content_type not in {"text/html", "application/xhtml+xml"}:
                     raise
-                gallery = _Gallery()
-                gallery.feed(data.decode("utf-8", errors="replace"))
-                links = gallery.urls(url)
-                if not links:
-                    raise ValueError("no gallery photos found in the page; use a direct image link")
-                dest = output or _free(Path.cwd() / "listing-clean")
+                links = _gallery_links(url, data)
+                folder = "listing-photos" if download_only else "listing-clean"
+                dest = output or _free(Path.cwd() / folder)
                 dest.mkdir(parents=True, exist_ok=output is not None)
-                done, total = _run_gallery(links, work, dest, cfg, target, inpaint)
+                done, total = _run_gallery(links, work, dest, save)
             else:
-                dest = output or _free(Path.cwd() / f"{src.stem}-clean{src.suffix}")
-                done, total = _run_image(src, dest, cfg, target, inpaint), 1
+                name = src.name if download_only else f"{src.stem}-clean{src.suffix}"
+                dest = output or _free(Path.cwd() / name)
+                done, total = save(src, dest), 1
     else:
+        if download_only:
+            raise ValueError("--download-only requires an HTTP(S) link")
         src = Path(source).expanduser().resolve(strict=True)
         if src.is_dir():
             dest = (output or _free(src.with_name(src.name + "-clean"))).resolve()
@@ -202,5 +296,6 @@ def run_batch(source, output, cfg, target, inpaint):
         else:
             dest = output or _free(src.with_name(f"{src.stem}-clean{src.suffix}"))
             done, total = _run_image(src, dest, cfg, target, inpaint), 1
-    log.info("Cleaned %d of %d %s", done, total, "image" if total == 1 else "images")
+    log.info("%s %d of %d %s", "Downloaded" if download_only else "Cleaned",
+             done, total, "image" if total == 1 else "images")
     return 0 if done == total else 1

@@ -16,7 +16,7 @@ from PIL import Image, ImageOps, JpegImagePlugin
 
 from .detect import build_mask, find, score_at
 from .inpaint import remove
-from .overlays import ReferenceOverlays, locate, overlay_mask
+from .overlays import ReferenceOverlays, locate, matches_overlay, overlay_mask
 from .tilted import MIN_WORD_EVIDENCE
 
 log = logging.getLogger("wmremove")
@@ -132,7 +132,7 @@ def clean_image(original, dest, cfg, target, inpaint, *, exclusive=False):
         matches = [
             (overlay.template, det, overlay_mask(gray.shape, overlay, det, cfg.mask_grow))
             for overlay in target.designs
-            if (det := locate(gray, overlay)) and det.score >= overlay.min_score
+            if (det := locate(gray, overlay)) and matches_overlay(gray, overlay, det)
         ]
         score = max((det.score for _, det, _ in matches), default=None)
         reversed_blend = target.tilted_torque.reverse(rgb)

@@ -2,7 +2,7 @@
 
 ## Photo cleanup
 
-Use the [remove-car-overlays skill](.claude/skills/remove-car-overlays/SKILL.md) when a user supplies a photo, link, or folder to clean. Run the app and return the cleaned files.
+Use the [remove-car-overlays skill](.claude/skills/remove-car-overlays/SKILL.md) when a user supplies a photo or folder to clean, or pastes a QatarSale, Mzad Qatar, or Qatar Living car listing link. A listing link by itself means download the gallery. If the user asks for cleanup, remove the supported overlays too.
 
 If you cloned this repo for the user in the current task, follow the [first-clone instructions](README.md#first-clone-with-claude-code) before replying.
 

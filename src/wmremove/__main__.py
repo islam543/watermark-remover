@@ -19,18 +19,23 @@ from .pipeline import Config, log, open_db, poll_once, resume
 
 def main():
     parser = argparse.ArgumentParser(description="Remove the QatarSale, Torque Motors, Qatar Living and Mzad Qatar image overlays.")
-    parser.add_argument("source", nargs="?", help="image file, folder, or HTTP(S) image or gallery link")
+    parser.add_argument("source", nargs="?", help="image file, folder, or link to an image, car listing, or showroom")
     parser.add_argument("-o", "--output", type=Path, help="output file for a single image or output folder for a batch")
+    parser.add_argument("--download-only", action="store_true", help="save photos from a link without removing overlays")
     args = parser.parse_args()
     if args.output and not args.source:
         parser.error("--output requires an input file, folder, or link")
+    if args.download_only and not args.source:
+        parser.error("--download-only requires a link")
 
     logging.basicConfig(stream=sys.stdout, level=logging.INFO, format="%(asctime)s %(message)s")
-    cfg = Config.from_env()
-    try:
-        target = Template(cfg.template) if "WM_TEMPLATE" in os.environ or cfg.template.is_file() else load_overlays()
-    except (OSError, ValueError) as exc:
-        parser.exit(1, f"{exc}\n")
+    cfg = target = None
+    if not args.download_only:
+        cfg = Config.from_env()
+        try:
+            target = Template(cfg.template) if "WM_TEMPLATE" in os.environ or cfg.template.is_file() else load_overlays()
+        except (OSError, ValueError) as exc:
+            parser.exit(1, f"{exc}\n")
 
     @cache
     def model():
@@ -42,7 +47,7 @@ def main():
 
     if args.source:
         try:
-            return run_batch(args.source, args.output, cfg, target, inpaint)
+            return run_batch(args.source, args.output, cfg, target, inpaint, download_only=args.download_only)
         except (OSError, ValueError) as exc:
             log.error("%s", exc)
             return 1
